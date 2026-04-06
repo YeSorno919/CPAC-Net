@@ -67,7 +67,7 @@ mdurl==0.1.2
 MedPy==0.5.2
 mkl_fft==1.3.8
 mkl_random==1.2.4
-monai==1.5.0
+monai==1.3.0
 mpmath==1.3.0
 multipledispatch==1.0.0
 mygrad==2.3.0
