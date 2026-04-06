@@ -1,0 +1,926 @@
+"""
+
+    此代码为50%标注下，双源互补(DCPF)+变形图像补充监督(DISS)的实验 少了强弱增强一致性(DRS-PIWAC),注意没有进行数据增强，但有一致性
+    若要消融DISS，修改损失即可
+
+"""
+import argparse
+import logging
+import os
+import random
+import shutil
+import sys
+import time
+from unet_model import *
+from mt_Dataset import *
+from predict import predict
+from calzhibiao import cal_zhibiao,cal_zhibiao_hys_dantongdao,cal_zhibiao_hys_dantongdao_teshubiaozhunhua_RCPS,cal_zhibiao_hys_dantongdao_jiandanguiyihua_RCPS
+from tensorboardX import SummaryWriter
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.nn import BCEWithLogitsLoss
+from torch.nn.modules.loss import CrossEntropyLoss
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.utils import make_grid
+from tqdm import tqdm
+import shutil
+import losses,  ramps
+from mt_Dataset import (hysDataSets, TwoStreamBatchSampler,hysDataSetsdantongdao)
+import losses, metrics, ramps
+
+# from FCN_resnet import *
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
+import itertools
+import glob
+from draw_image import draw_pseudo_gland_over_image
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import pandas as pd
+def kaiming_normal_init_weight(model):
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            torch.nn.init.kaiming_normal_(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            m.weight.data.fill_(1)
+            m.bias.data.zero_()
+    return model
+
+
+def xavier_normal_init_weight(model):
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            torch.nn.init.xavier_normal_(m.weight)
+        elif isinstance(m, nn.BatchNorm2d):
+            m.weight.data.fill_(1)
+            m.weight.data.fill_(1)
+            m.weight.data.fill_(1)
+            m.weight.data.fill_(1)
+            m.weight.data.fill_(1)
+            m.weight.data.fill_(1)
+            m.bias.data.zero_()
+    return model
+
+class ConfusionMatrix_new(object):
+    def __init__(self, num_classes):
+        self.num_classes = num_classes
+        self.mat = None
+
+    def update(self, a, b):
+        n = self.num_classes
+        if self.mat is None:
+            # 创建混淆矩阵
+            self.mat = np.zeros((n, n), dtype=np.int64)
+        with torch.no_grad():
+            # 寻找GT中为目标的像素索引
+            k = (a >= 0) & (a < n)
+            # 统计像素真实类别a[k]被预测成类别b[k]的个数(这里的做法很巧妙)
+            inds = n * a[k] + b[k]
+            self.mat += np.bincount(inds, minlength=n ** 2).reshape(n, n)
+
+    def reset(self):
+        if self.mat is not None:
+            self.mat.zero_()
+
+    def compute(self):
+        h = self.mat
+        # 计算全局预测准确率(混淆矩阵的对角线为预测正确的个数)
+        acc_global = np.diag(h).sum() / h.sum()
+        # 计算每个类别的准确率
+        acc = np.diag(h) / h.sum(1)
+        # 计算每个类别预测与真实目标的iou
+        iu = np.diag(h) / (h.sum(1) + h.sum(0) - np.diag(h))
+        return acc_global, acc, iu
+
+    def reduce_from_all_processes(self):
+        if not np.distributed.is_available():
+            return
+        if not np.distributed.is_initialized():
+            return
+        np.distributed.barrier()
+        np.distributed.all_reduce(self.mat)
+
+    def __str__(self):
+        acc_global, acc, iu = self.compute()
+        return (
+            'global correct: {:.10f}\n'
+            'average row correct: {}\n'
+            'IoU: {}\n'
+            'mean IoU: {:.10f}').format(
+            acc_global.item() * 100,
+            ['{:.10f}'.format(i) for i in (acc * 100).tolist()],
+            ['{:.10f}'.format(i) for i in (iu * 100).tolist()],
+            iu.mean().item() * 100)
+
+    def iou(self):
+        iu = self.compute()[2]
+        return iu.tolist()[1]
+    def acc_global(self):
+        acc_global = self.compute()[0]
+        return acc_global
+
+
+def get_current_consistency_weight(epoch,consistency=0.1,consistency_rampup=200):
+    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    return consistency * ramps.sigmoid_rampup(epoch, consistency_rampup)
+
+
+def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+transform = transforms.Compose([
+    transforms.ToTensor()
+    # ,transforms.Resize((360,740))
+])
+
+def calculate_metrics(true_labels, pred_labels, class_label):
+    """
+    计算指定类别的精确率和召回率
+    :param true_labels: 真实标签数组
+    :param pred_labels: 预测标签数组
+    :param class_label: 要计算的类别标签
+    :return: 精确率和召回率
+    """
+    # 计算背景类
+    if(class_label==0):
+        pred_labels=1-pred_labels
+    # 计算 TP、FP、FN
+    tp = np.sum((true_labels == class_label) & (pred_labels == class_label)) # #正确预测为背景
+    fp = np.sum((true_labels != class_label) & (pred_labels == class_label)) # 背景错误预测为腺体
+    fn = np.sum((true_labels == class_label) & (pred_labels != class_label)) # 腺体错误预测为背景
+
+    # 避免除零错误
+    if tp + fp == 0:
+        precision = 0
+    else:
+        precision = tp / (tp + fp)
+
+    if tp + fn == 0:
+        recall = 0
+    else:
+        recall = tp / (tp + fn)
+
+    return precision, recall
+
+
+def train(snapshot_path,zhibiao_dir,fold_num,data_file,epo_num=500,baifenbi=1,confidence_threshold=0.95):#bili用指百分之多少标注数据
+    save_train_img = False
+    confidence_threshold = confidence_threshold
+    fold_num =fold_num
+    num_classes = 2
+    batch_size = 1
+    epo_num = epo_num
+    data_file_name=data_file
+    data_file_name=data_file_name.split('/')[-1].split('.')[0]
+    model_path=os.path.join(snapshot_path,data_file_name)
+    if not os.path.exists(model_path):
+        print("%s没有，正在创建" % model_path)
+        os.makedirs(model_path)
+    def create_model(n_channels, n_classes, bilinear, ema=False,aux=False):
+        # model = UNet_seg_2d_RCPS_base(n_channels, n_classes)
+        # 输出包含编码器第一层的特征，用于后续计算两张图像的余弦相似度
+        model = UNet_seg_2d_RCPS_with_confidence(n_channels, n_classes)
+        
+        if ema:
+            for param in model.parameters():
+                param.detach_()
+
+        return model
+    logging.info(data_file_name)
+    device = torch.device('cuda:1')
+    model1 = create_model(1, 2, bilinear=True, ema=False,aux=False).to(device)
+    # model1 = kaiming_normal_init_weight(model1)
+    model2 = create_model(1, 2, bilinear=True, ema=True,aux=False).to(device)
+    # model2 = kaiming_normal_init_weight(model2)
+    # 配准模型
+    reg_model ='CPAC_Net/Reg_Model/20240929_5folds_reg_se_2pamV1_training_info_k_0_channels_1_classes_2_epoches_200_iters_200_batch_size_1_is_aug_True_L_sim_1ssim_1ncc_1loss_sec'
+    pth_files = glob.glob(os.path.join(reg_model,str(fold_num), '*.pth')) 
+    
+    pretrainRegmodel=pth_files[0]
+    print(pretrainRegmodel)
+    Reger = UNet_reg_with_se_2pam(n_channels=1).to(device)
+
+    if(pretrainRegmodel!=''): #如果已经有预训练的配准模型，则直接加载不要进行训练了
+        Reger.load_state_dict(torch.load(pretrainRegmodel))
+    
+ 
+
+    db_train= hysDataSets_dantongdao_jiandanguiyihua_50_75percent(data_file=data_file, img_path="/mnt/hys/Datasets/重复测量（hys整理版）/img_crop_npy", zhibiao_dir=zhibiao_dir,
+                            split="train",baifenbi=baifenbi,with_affine_field=True)
+    db_test = hysDataSets_dantongdao_jiandanguiyihua(data_file=data_file, img_path="/mnt/hys/Datasets/重复测量（hys整理版）/img_crop_npy", zhibiao_dir=zhibiao_dir,
+                          split="test")
+    db_val = hysDataSets_dantongdao_jiandanguiyihua(data_file=data_file, img_path="/mnt/hys/Datasets/重复测量（hys整理版）/img_crop_npy", zhibiao_dir=zhibiao_dir,
+                          split="val")
+
+    total_slices = len(db_train)
+    labeled_slice = total_slices//2  # 通过index 划分label&unlabel
+    print("Total silices is: {}, labeled slices is: {}".format(
+        total_slices, labeled_slice))
+    trainloader = DataLoader(db_train, batch_size=batch_size, shuffle=True,worker_init_fn=3407)#pin_memory 是加快速度 内存大可以设置为True
+
+    model1.train()
+    model2.train()
+    Reger.eval()
+
+    valloader = DataLoader(db_val, batch_size=1, shuffle=False,
+                           num_workers=1)
+    testloader = DataLoader(db_test, batch_size=1, shuffle=False,
+                           num_workers=1)
+
+
+    optimizer1= torch.optim.AdamW(model1.parameters(), lr=0.01,weight_decay=1e-6)
+    # 设置余弦退火的学习率调度器
+    T_max = 200  # 一个周期的最大步数
+    scheduler1= CosineAnnealingLR(optimizer1, T_max=T_max, eta_min=0.0001)
+    # optimizer2 = optim.SGD(model2.parameters(), lr=0.01,
+    #                        momentum=0.9)
+    max_epoch = epo_num
+    ce_loss = CrossEntropyLoss().to(device)
+    dice_loss = losses.DiceLoss(num_classes).to(device)
+    writer = SummaryWriter(snapshot_path + '/log/'+str(fold_num))
+    logging.info("{} iterations per epoch".format(len(trainloader)))
+
+    iter_num = 0
+    best_performance1 = 0.0
+    best_performance2 = 0.0
+    scaler = GradScaler()
+    iterator = tqdm(range(max_epoch), ncols=70)
+
+    num_thre=baifenbi*epo_num
+    print("num_thred:",num_thre)
+    
+    pseudo_all_metrics = []
+    for epoch_num in iterator:
+        for i_batch, sampled_batch in enumerate(trainloader):
+            
+            label_image, label = sampled_batch['image'], sampled_batch['label']
+            label_image, label= label_image.to(device), label.to(device)
+            unlabel_image=sampled_batch['unlabel_image'].to(device)
+            unlabelname = sampled_batch['unlabelname']
+            # 有标签往无标签仿射的图像
+            affine_img, affine_label,affine_label_onehot = sampled_batch['l_u_img'].to(device), sampled_batch['l_u_seg'].to(device),sampled_batch['l_u_seg_onehot'].to(device)
+            # 有标签往无标签的变形图像以及标签
+            w_img_l_u,_, w_seg_l_u_onehot, _,_ = Reger(affine_img, unlabel_image, affine_label_onehot,None)
+            
+            with autocast():
+                # 有标签
+                label_outputs = model1(label_image)['output'] #未经过归一化处理的原始输出，可以是任意实数
+                label_outputs_soft = torch.softmax(label_outputs, dim=1) #概率分布（0-1）
+                # 无标签
+                unlabel_outputs1 = model1(unlabel_image)['output'] #未经过归一化处理的原始输出，可以是任意实数
+                unlabel_outputs_soft1 = torch.softmax(unlabel_outputs1, dim=1)
+                
+                #编写图像以及编写标签也送入训练。
+                w_img_l_u_output = model1(w_img_l_u)['output'] #未经过归一化处理的原始输出，可以是任意实数
+                w_img_l_u_output_soft = torch.softmax(w_img_l_u_output, dim=1)
+
+                with torch.no_grad():
+                    
+                    unlabel_output2=model2(unlabel_image)["output"] #1,2 350 740 #预测的概率值
+                    # 获取两张图像编码的第一层特征用于计算余弦相似度。
+                    unlabel_image_encode_1=model2(unlabel_image)["encode_1"]
+                    wrap_l_u_encode_1=model2(w_img_l_u)["encode_1"]
+                preds = F.softmax(unlabel_output2, dim=1)
+                # 无标签图像预测的不确定性
+                uncertainty = -1.0 * \
+                    torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
+                consistency_weight = 0.01+0.1*get_current_consistency_weight(epoch_num) #get_current_consistency_weight(epoch_num)最大值为0.1
+                # print(outputs1.shape,outputs2.shape)
+                
+                # 用教师模型上第一层的编码特征计算变形图像与无标签图像的余弦相似度
+                sim = F.cosine_similarity(unlabel_image_encode_1.detach(), wrap_l_u_encode_1.detach(), dim=1) #1 350 740
+                sim_unsqueze = sim.unsqueeze(1)
+                simility_confident_mask = (sim > confidence_threshold).unsqueeze(1) # 1*1*350*740 值0或者1
+                
+                simility_confident_mask_np = simility_confident_mask.detach().cpu().numpy()[0][0]  
+                simility_confident_mask_np = simility_confident_mask_np.astype('uint8')  # 转换为 uint8 类型
+                # 这里算的的是无标签图像加噪声和没加噪声前后的一致性
+                # 在训练初期，模型对数据的理解还不够准确，不确定性较高，此时较低的阈值可以让模型更关注那些不确定性较低的样本，即模型比较有把握的样本，进行学习和优化。
+                # 随着训练的进行，模型的性能逐渐提升，对数据的理解也更加深入，此时逐渐升高阈值，可以让模型开始关注那些在训练初期被认为不确定性较高的样本，进一步挖掘这些样本中的信息，提高模型的泛化能力
+                #  阈值从 0.75 * np.log(2) 升高到 (0.75 + 0.25) * np.log(2)。 
+                #  (0.51986025，0.693147]  np.log(2)大约为0.693147
+                # threshold = (0.75+0.25*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)))*np.log(2)
+
+                # print("threshold",threshold)
+               
+                # print(ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)))
+                # #(0.0047，0.693147]  np.log(2)大约为0.693147
+                # threshold = (0+1*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)))*np.log(2)
+                
+                # threshold = (0.5+0.5*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)))
+                                
+                #
+                # threshold = (0.5+0.5*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)*np.log(2)))
+                # # [0.5023,0.84657]
+                # threshold = (0.5+0.5*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader))*np.log(2))
+                # [0.5023,0.94657]
+                # ramps.sigmoid_rampup(iter_num, max_epoch*len(trainloader))*np.log(2) =0.69314
+                # threshold = (0.6+0.5*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader))*np.log(2))
+                # [0.5023,0.84657]
+                threshold = (0.6+0.4*ramps.sigmoid_rampup(iter_num,
+                                            max_epoch*len(trainloader))*np.log(2))
+                #  0.75 * np.log(2) 升高到 (0.75 + 0.25) * np.log(2)。 
+                # (0.51986025，0.693147] 
+                # threshold = (0.75+0.25*ramps.sigmoid_rampup(iter_num,
+                #                             max_epoch*len(trainloader)))*np.log(2)
+                print("threshold",threshold)
+                # 高于阈值的“确定”掩码
+                certain_mask = (uncertainty < threshold) # 1*1*350*740 值false或者true
+                # 低于阈值的不确定性掩码，与置信度高的区域进行相与，得到相对可信补充。将补充的掩码叠加到certain_mask中得到生成的掩码
+                uncertain_mask = (uncertainty >= threshold) # 1*1*350*740 值false或者true
+                # 教师模型预测不确定的像素用配准的标签中高置信度的像素代替。得到的是需要补充的点。
+                buchong_mask=torch.logical_and(simility_confident_mask, uncertain_mask)# 1*1*350*740 值false或者true
+
+                generate_mask = (torch.logical_or(certain_mask, buchong_mask)).float()
+                # 判断是否有大于 1 的值
+                # has_greater_than_one = torch.any(generate_mask > 1)
+                
+                # print(has_greater_than_one.item())
+                # has_less_than_zero = torch.any(generate_mask < 0)
+                
+                # print(has_less_than_zero.item())
+                # 生成的标签由教师模型预测的确定标签和配准得到的可信标签组成。
+                # preds 获得的是预测的概率，w_seg_l_u_onehot的值是0或者1.不能简单相加,可以用满足阈值的置信度作为该点的预测概率
+                # 该值必须在0-1之间
+                
+
+                # w_seg_l_u_onehot1 = (w_seg_l_u_onehot.detach().cpu().numpy()[0,0])*255
+                # w_seg_l_u_onehot1 = w_seg_l_u_onehot1.astype('uint8')  # 转换为 uint8 类型
+                
+                # w_seg_l_u_onehot2 = (w_seg_l_u_onehot.detach().cpu().numpy()[0,1])*255
+                # w_seg_l_u_onehot2 = w_seg_l_u_onehot2.astype('uint8')  # 转换为 uint8 类型
+                # cv2.imwrite('/mnt/hys/w_seg_l_u_onehot1.png', w_seg_l_u_onehot1)
+                # cv2.imwrite('/mnt/hys/w_seg_l_u_onehot2.png', w_seg_l_u_onehot2)
+
+                
+                # 将另一个通道补充。使一个像素点的两通道相加为1
+                result=w_seg_l_u_onehot*sim_unsqueze
+                # 分离通道
+                background_channel = result[:, 0:1, :, :]
+                gland_channel = result[:, 1:2, :, :]
+
+                # 计算互补值
+                background_complement = 1 - gland_channel
+                gland_complement = 1 - background_channel
+
+                # 补齐通道
+                background_channel = torch.where(background_channel == 0, background_complement, background_channel)
+                gland_channel = torch.where(gland_channel == 0, gland_complement, gland_channel)
+
+                # 合并通道
+                final_sim_unsqueze = torch.cat([background_channel, gland_channel], dim=1)
+                                
+                # t =buchong_mask.float()*w_seg_l_u_onehot*sim_unsqueze
+                
+                t =buchong_mask.float()*final_sim_unsqueze
+                
+                t2=(certain_mask.float()*preds)
+                
+                
+                generate_label = certain_mask.float()*preds+buchong_mask.float()*final_sim_unsqueze
+                
+                generate_label_soft = torch.softmax(generate_label,dim=1)
+                generate_label_argmax = torch.argmax(generate_label_soft, dim=1)
+                if(save_train_img):
+                    if(iter_num%len(trainloader)==0 and epoch_num%1 ==0):
+                    # if(1)
+                        if iter_num%len(trainloader)==0 and epoch_num%10 ==0:
+                            plt.rcParams['font.size'] = 30
+                            fig, axes =plt.subplots(nrows=2,ncols=10,figsize=(50, 40))
+                            axes[0,0].imshow(((unlabel_image[0][0].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,0].set_title("unlabelimg")
+                            axes[1,0].imshow(((label_image[0][0].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,0].set_title("labelimg")
+                            # Ai图像
+                            axes[0,1].imshow(((w_img_l_u[0][0].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,1].set_title("l_u")
+                            # Ai的腺体标签
+                            axes[1,1].imshow(((label[0].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,1].set_title("label_gland")
+                            
+                            
+                            axes[0,2].imshow(((w_seg_l_u_onehot[0][1].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,2].set_title("warp_gland")
+                            
+                            axes[1,2].imshow(((w_seg_l_u_onehot[0][0].detach().cpu().numpy())*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,2].set_title("warp_bg")
+                            
+                            
+                            axes[0,3].imshow((((certain_mask).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,3].set_title("certain_mask")
+            
+                            axes[1,3].imshow((((simility_confident_mask).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,3].set_title("simility_confident_mask")
+
+                            axes[0,4].imshow((((buchong_mask).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,4].set_title("buchong_mask")
+                            # data = (((generate_mask).detach().cpu().numpy()[0, 0]) * 255).astype(np.uint8)
+                            # print("数据类型:", data.dtype)
+                            # print("数据最小值:", data.min())
+                            # print("数据最大值:", data.max())
+                            axes[1,4].imshow((((generate_mask).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,4].set_title("generate_mask")
+                            # 
+                            axes[0,5].imshow((((t).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,5].set_title("buchong_bg_label")
+                            
+
+                            axes[1,5].imshow((((t).detach().cpu().numpy()[0,1])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,5].set_title("buchong_gland_label")
+                            
+                            axes[0,6].imshow((((torch.argmax(preds,dim=1)).detach().cpu().numpy()[0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,6].set_title("pred_seg")
+                            axes[1,6].imshow((((torch.argmax(t2,dim=1)).detach().cpu().numpy()[0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,6].set_title("certain_seg")
+                            
+                            axes[0,7].imshow((((generate_label).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,7].set_title("generate_bg_gailv")
+                                            
+                            axes[1,7].imshow((((generate_label).detach().cpu().numpy()[0,1])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,7].set_title("generate_gland_gailv")
+                            axes[0,8].imshow((((generate_label_soft).detach().cpu().numpy()[0,0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,8].set_title("generate_bg_soft")
+                                        
+                            axes[1,8].imshow((((generate_label_soft).detach().cpu().numpy()[0,1])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[1,8].set_title("generate_gland_soft")
+                        
+                            axes[0,9].imshow((((generate_label_argmax).detach().cpu().numpy()[0])*255).astype(np.uint8),cmap="gray", vmin=0, vmax=255)
+                            axes[0,9].set_title("generate_label_argmax")
+                                        
+                            axes[1,9].axis('off') 
+                            # 调整子图之间的间距
+                            plt.tight_layout()
+                            # plt.show()
+                            # 保存图像
+                            save_generate_image_file = os.path.join(snapshot_path+'/generate_image/'+str(fold_num))
+                            if not os.path.exists(save_generate_image_file):
+                                os.makedirs(save_generate_image_file)
+                            generate_image_name = "epoch{0}_iter{1}.jpg".format(epoch_num,iter_num)
+                            plt.savefig(os.path.join(save_generate_image_file,generate_image_name))
+                            plt.close()
+                        
+                        save_pseudo_image_file = os.path.join(snapshot_path+'/pseudo_label_generate/'+str(fold_num))
+                        
+                        if not os.path.exists(save_pseudo_image_file):
+                            os.makedirs(save_pseudo_image_file)
+                            # (173, 216, 230)淡蓝色，
+                            # (144, 238, 144)淡绿色
+                            # (255, 223, 0)淡黄色
+                        overlay_color = [(255, 223, 0), (173, 216, 230)] 
+                        alpha = 0.2
+                        
+                        
+                        
+                        save_bf_pseudo_image_file = os.path.join(snapshot_path+'/pseudo_label_bf/'+str(fold_num))
+                        if not os.path.exists(save_bf_pseudo_image_file):
+                            os.makedirs(save_bf_pseudo_image_file)
+                        pseudo_name = "e{0}_i{1}_{2}".format(epoch_num,iter_num,unlabelname[0])
+
+                        # have_save =False
+                        have_save =True
+                        if have_save ==False:
+                            gland_generate_complement = (generate_label_argmax).detach().cpu().numpy()[0]
+                            bg_generate_complement = 1-gland_generate_complement
+                                # 用于监督的伪标签
+                            gland_generate_for_sup = gland_generate_complement*generate_mask.detach().cpu().numpy()
+                            bg_generate_for_sup = bg_generate_complement*generate_mask.detach().cpu().numpy()
+                            draw_pseudo_gland_over_image(save_pseudo_image_file,((unlabel_image[0][0].detach().cpu().numpy())*255).astype(np.uint8),(gland_generate_for_sup[0,0]*255).astype(np.uint8),(bg_generate_for_sup[0,0]*255).astype(np.uint8),overlay_color,alpha,pseudo_name)
+                                
+                                
+                                # save_bf_pseudo_image_file = os.path.join(snapshot_path+'/pseudo_label_bf/'+str(fold_num))
+
+                            pred_gland=(torch.argmax(preds,dim=1)).detach().cpu().numpy()[0]
+                            pred_bg = 1- pred_gland 
+                            gland_pred_certain = pred_gland*certain_mask.detach().cpu().numpy()
+                            bg_pred_certain = pred_bg*certain_mask.detach().cpu().numpy()
+                            draw_pseudo_gland_over_image(save_bf_pseudo_image_file,((unlabel_image[0][0].detach().cpu().numpy())*255).astype(np.uint8),(gland_pred_certain[0,0]*255).astype(np.uint8),(bg_pred_certain[0,0]*255).astype(np.uint8),overlay_color,alpha,pseudo_name)
+                                
+                                
+                                # 加载数据时记得同时读取无标签图像的标签数据
+                            unlabel_img_label_for_compair = sampled_batch['unlabel_img_label_for_compair'].numpy()
+                            save_true_label_file = os.path.join(snapshot_path+'/true_label_bf/'+str(fold_num))
+                            if not os.path.exists(save_true_label_file):
+                                os.makedirs(save_true_label_file)
+                                    
+                            draw_pseudo_gland_over_image(save_true_label_file,((unlabel_image[0][0].detach().cpu().numpy())*255).astype(np.uint8),(unlabel_img_label_for_compair[0]*255).astype(np.uint8),((1-unlabel_img_label_for_compair[0])*255).astype(np.uint8),overlay_color,alpha,pseudo_name)
+                                
+                            
+                            
+                            # 剔除不参与训练的像素，补充前
+                            unlabel_img_label_for_compair = unlabel_img_label_for_compair[0]
+                            true_labels_filtered_bf = unlabel_img_label_for_compair[certain_mask.detach().cpu().numpy()[0,0]]
+                            pseudo_labels_filtered_bf = pred_gland[certain_mask.detach().cpu().numpy()[0,0]]
+                            
+                            true_labels_filtered_af = unlabel_img_label_for_compair[generate_mask.detach().cpu().numpy()[0,0].astype(bool)]
+                            pseudo_labels_filtered_af = gland_generate_complement[generate_mask.detach().cpu().numpy()[0,0].astype(bool)]
+                            
+                            # 计算准确率
+                            accuracy_bf = accuracy_score(true_labels_filtered_bf, pseudo_labels_filtered_bf)
+
+                            # 计算精确率
+                            precision_bf = precision_score(true_labels_filtered_bf, pseudo_labels_filtered_bf)
+
+                            # 计算召回率
+                            recall_bf = recall_score(true_labels_filtered_bf, pseudo_labels_filtered_bf)
+
+                            # 计算F1 - score
+                            f1_bf = f1_score(true_labels_filtered_bf, pseudo_labels_filtered_bf)
+
+                            # 计算准确率
+                            accuracy_af = accuracy_score(true_labels_filtered_af, pseudo_labels_filtered_af)
+
+                            # 计算精确率
+                            precision_af = precision_score(true_labels_filtered_af, pseudo_labels_filtered_af)
+
+                            # 计算召回率
+                            recall_af = recall_score(true_labels_filtered_af, pseudo_labels_filtered_af)
+
+                            # 计算F1 - score
+                            f1_af = f1_score(true_labels_filtered_af, pseudo_labels_filtered_af)
+                            
+                            
+                            # 计算交集
+                            intersection_bf = np.sum(true_labels_filtered_bf & pseudo_labels_filtered_bf)
+
+                            # 计算并集
+                            union_bf = np.sum(true_labels_filtered_bf | pseudo_labels_filtered_bf)
+
+                            # 计算IoU
+                            iou_bf = intersection_bf / union_bf
+
+                            # 计算Dice系数
+                            dice_bf = 2 * intersection_bf / (np.sum(true_labels_filtered_bf) + np.sum(pseudo_labels_filtered_bf))
+
+                            # 计算交集
+                            intersection_af = np.sum(true_labels_filtered_af & pseudo_labels_filtered_af)
+
+                            # 计算并集
+                            union_af = np.sum(true_labels_filtered_af | pseudo_labels_filtered_af)
+
+                            # 计算IoU
+                            iou_af = intersection_af / union_af
+
+                            # 计算Dice系数
+                            dice_af = 2 * intersection_af / (np.sum(true_labels_filtered_af) + np.sum(pseudo_labels_filtered_af))
+                            # ====================================================
+                            # 背景类
+
+                            # 计算精确率
+                            bg_precision_bf = precision_score(true_labels_filtered_bf, pseudo_labels_filtered_bf,pos_label=0)
+
+                            # 计算召回率
+                            bg_recall_bf = recall_score(true_labels_filtered_bf, pseudo_labels_filtered_bf,pos_label=0)
+
+                            # 计算F1 - score
+                            bg_f1_bf = f1_score(true_labels_filtered_bf, pseudo_labels_filtered_bf,pos_label=0)
+
+
+                            # 计算精确率
+                            bg_precision_af = precision_score(true_labels_filtered_af, pseudo_labels_filtered_af,pos_label=0)
+
+                            # 计算召回率
+                            bg_recall_af = recall_score(true_labels_filtered_af, pseudo_labels_filtered_af,pos_label=0)
+
+                            # 计算F1 - score
+                            bg_f1_af = f1_score(true_labels_filtered_af, pseudo_labels_filtered_af,pos_label=0)
+                            
+                            metrics = {
+                                    'image_name':unlabelname[0],
+                                    'epoch_&_iter':(epoch_num,iter_num),
+                                    'accuracy_bf': accuracy_bf,
+                                    'accuracy_af': accuracy_af,
+                                    'gland_precision_bf':precision_bf,
+                                    'gland_precision_af':precision_af,
+                                    'gland_recall_bf':recall_bf,
+                                    'gland_recall_af':recall_af,
+                                    'gland_f1_bf':f1_bf,
+                                    'gland_f1_af':f1_af,
+                                    'iou_bf':iou_bf,
+                                    'iou_af':iou_af,
+                                    'dice_bf':dice_bf,
+                                    'dice_af':dice_af,
+                                    'accuracy_cha':round(accuracy_af-accuracy_bf, 4),
+                                    'gland_precision_cha':round(precision_af-precision_bf, 4),
+                                    'gland_recall_cha':round(recall_af-recall_bf, 4),
+                                    'gland_f1_cha':round(f1_af-f1_bf, 4),
+                                    'iou_cha':round(iou_af-iou_bf, 4),
+                                    'dice_cha':round(dice_af-dice_bf, 4),
+                                    'bg_precision_bf':bg_precision_bf,
+                                    'bg_recall_bf':bg_recall_bf,
+                                    'bg_f1_bf':bg_f1_bf,
+                                    'bg_precision_af':bg_precision_af,
+                                    'bg_recall_af':bg_recall_af,
+                                    'bg_f1_af':bg_f1_af,
+                                    'bg_precision_cha':round(bg_precision_af-bg_precision_bf, 4),
+                                    'bg_recall_cha':round(bg_recall_af-bg_recall_bf, 4),
+                                    'bg_f1_cha':round(bg_f1_af-bg_f1_bf, 4),
+                            }
+                            pseudo_all_metrics.append(metrics)
+                    
+                # consistency_dist = losses.softmax_mse_loss(unlabel_outputs_soft1, generate_label)
+                # 定义交叉熵损失函数
+                criterion = nn.CrossEntropyLoss(reduction='none').to(device)#会自动对模型的原始输出进行softmax，将其转化成概率分布在计算ce损失
+                # 计算交叉熵损失，输入的是未归一化的原始输出和类别标签
+                consistency_dist = criterion(unlabel_outputs1,generate_label_argmax ) #
+                # consistency_dist = losses.softmax_mse_loss(unlabel_outputs_soft1, generate_label_soft)
+
+                # print(torch.sum(generate_mask==1))
+                
+                consistency_loss = torch.sum(
+                generate_mask*consistency_dist)/(2*torch.sum(generate_mask)+1e-16)
+                loss_dice = dice_loss(
+                    label_outputs, label.unsqueeze(1))
+                loss_ce = ce_loss(label_outputs,
+                              label.long())
+
+                # supervised_loss=loss_dice+loss_ce
+                # supervised_loss=loss_dice+0.5*loss_ce
+                # # 变形图像送入学生模型计算有监督的损失
+                w_seg_l_u_label = w_seg_l_u_onehot[:,1,:,:]
+                warp_loss_dice = dice_loss(
+                    w_img_l_u_output, w_seg_l_u_label.unsqueeze(1))
+                warp_loss_ce = ce_loss(w_img_l_u_output,
+                              w_seg_l_u_label.long())
+                supervised_loss=loss_dice+0.5*loss_ce+0.5*(warp_loss_dice+0.5*warp_loss_ce)
+            loss = supervised_loss + consistency_weight * consistency_loss
+            # loss=loss1
+
+        
+
+                
+
+
+            optimizer1.zero_grad()
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer1)
+
+            scaler.update()
+            update_ema_variables(model1, model2, 0.99, iter_num)
+
+            iter_num = iter_num + 1
+
+            lr_=optimizer1.param_groups[0]['lr']
+            writer.add_scalar('info/lr', lr_, epoch_num)
+            writer.add_scalar('info/model1_total_loss', loss, epoch_num)
+            writer.add_scalar('info/supervised_loss', supervised_loss, epoch_num)
+            writer.add_scalar('info/consistency_loss',
+                              consistency_loss, epoch_num)
+            writer.add_scalar('info/consistency_weight',
+                              consistency_weight, epoch_num)
+            writer.add_scalar('info/uncertainty',
+                              threshold, epoch_num)
+            # logging.info(
+            #     'iteration %d : model1 loss : %f model2 loss : %f  pseudo_weight: %f lr:%f contour_loss1:%f contour_loss2:%f ' % (iter_num, model1_loss.item(), model2_loss.item(),consistency_weight,lr_,contour_loss1,contour_loss2))
+            logging.info(
+                'iteration %d : loss : %f   consistency_weight: %f lr:%f  ' % (iter_num, loss.item(), consistency_weight,lr_))
+            # logging.info(
+            #     'iteration %d : model1 loss : %f ' % (iter_num, loss.item()))
+
+            if iter_num%len(trainloader)==0:
+                scheduler1.step()
+                # scheduler2.step()
+                with torch.no_grad():
+                    model1.eval()
+                    model2.eval()
+                    iou_val1=[]
+                    iou_val2=[]
+                    avg_iou_val1=0.0
+                    avg_iou_val2=0.0
+                    iou_test1=[]
+                    iou_test2=[]
+                    avg_iou_test1=0.0
+                    avg_iou_test2=0.0
+                    # for i_batch, sampled_batch in enumerate(valloader):
+                    #     volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+                    #     volume_batch, label_batch = volume_batch.to(device), label_batch.to(device)
+                    #     optimizer1.zero_grad()
+                    #     # optimizer2.zero_grad()
+                    #     output1 = model1(volume_batch)["output"]
+                    #     output2 = model2(volume_batch)["output"]
+                    #     output1_np = output1.cpu().detach().numpy().copy()  
+                    #     output1_np = np.argmax(output1_np, axis=1)
+                    #     output2_np = output2.cpu().detach().numpy().copy()  
+                    #     output2_np = np.argmax(output2_np, axis=1)
+                    #     label_batch_np=label_batch.cpu().detach().numpy().copy()
+                    #     #------------计算val iou---------#
+                    #     for j in range(output1_np.shape[0]):
+                    #         matrix_val1 = ConfusionMatrix_new(2)
+                    #         img1, img_label = output1_np[j], label_batch_np[j]
+                    #         matrix_val1.update(img1, img_label)
+                    #         iou_val1.append(matrix_val1.iou())
+
+                    #     for j in range(output2_np.shape[0]):
+                    #         matrix_val2 = ConfusionMatrix_new(2)
+                    #         img2, img_label = output2_np[j], label_batch_np[j]
+                    #         matrix_val2.update(img2, img_label)
+                    #         iou_val2.append(matrix_val2.iou())
+                    # avg_iou_val1=sum(iou_val1)/len(iou_val1)
+                    # avg_iou_val2=sum(iou_val2)/len(iou_val2)
+                    
+                    # test
+                    for i_batch, sampled_batch in enumerate(testloader):
+                    # for i_batch, sampled_batch in enumerate(valloader):
+                        volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
+                        volume_batch, label_batch = volume_batch.to(device), label_batch.to(device)
+
+                        # output1 = model1(volume_batch)["output"]
+                        output2 = model2(volume_batch)["output"]
+                        # output1_np = output1.cpu().detach().numpy().copy()  
+                        # output1_np = np.argmax(output1_np, axis=1)
+                        output2_np = output2.cpu().detach().numpy().copy()  
+                        output2_np = np.argmax(output2_np, axis=1)
+                        label_batch_np=label_batch.cpu().detach().numpy().copy()
+                        #------------计算test iou---------#
+                        # for j in range(output1_np.shape[0]):
+                        #     matrix_test1 = ConfusionMatrix_new(2)
+                        #     img1, img_label = output1_np[j], label_batch_np[j]
+                        #     matrix_test1.update(img1, img_label)
+                        #     iou_test1.append(matrix_test1.iou())
+
+                        for j in range(output2_np.shape[0]):
+                            matrix_test2 = ConfusionMatrix_new(2)
+                            img2, img_label = output2_np[j], label_batch_np[j]
+                            matrix_test2.update(img2, img_label)
+                            iou_test2.append(matrix_test2.iou())
+                    # avg_iou_test1=sum(iou_test1)/len(iou_test1)
+                    avg_iou_test2=sum(iou_test2)/len(iou_test2)
+
+                    # if avg_iou_val1 > best_performance1:
+                    #     logging.info("model1"+str(iou_val1))
+                    #     best_model1=model1
+                    #     best_test_iou1=avg_iou_test1
+                    #     best_performance1 = avg_iou_val1
+                    #     save_mode_path = os.path.join(model_path,
+                    #                                 'model1_iter_{}_iou_{}.pth'.format(
+                    #                                     iter_num, round(best_performance1, 4)))
+                    #     save_best = os.path.join(model_path,
+                    #                             'model1_best.pth')
+                    #     # torch.save(model1.state_dict(), save_mode_path)
+                    #     torch.save(model1.state_dict(), save_best)
+
+                    # logging.info(
+                    #     'iteration %d : model1_mean_iou : %f' % (iter_num, avg_iou_val1))
+                    # logging.info(
+                    #     'iteration %d : model1_test_mean_iou : %f' % (iter_num, avg_iou_test1))
+
+
+                    
+
+                    if avg_iou_test2 > best_performance2: #保存验证集合上最好的模型
+                        logging.info("model2"+str(iou_test2))
+                        best_model2=model2
+                        best_performance2 = avg_iou_test2
+                        save_mode_path = os.path.join(model_path,
+                                                    'model2_iter_{}_mean_iou_{}.pth'.format(
+                                                        iter_num, round(best_performance2,4)))
+                        save_best = os.path.join(model_path,'model2_best.pth')
+                        # torch.save(model2.state_dict(), save_mode_path)
+                        torch.save(model2.state_dict(), save_best)
+                        best_performance_epoch = epoch_num
+                        logging.info(f"记录达到测试集上达到最优! Epoch: {best_performance_epoch}")
+                    # writer.add_scalar('test/model2_mean_iou', avg_iou_val2, epoch_num)
+                    writer.add_scalar('test/model2_mean_test_iou', avg_iou_test2, epoch_num)  
+
+                    logging.info(
+                        'iteration %d : model2_mean_test_iou : %f' % (iter_num, avg_iou_test2))
+                    model1.train()
+                    model2.train()
+    writer.close()                     
+
+    # 训练结束后，将所有指标写入 Excel 文件
+    df = pd.DataFrame(pseudo_all_metrics)
+    xlsx_path=os.path.join(snapshot_path,'pseudo_label_metrics')
+    if not os.path.exists(xlsx_path):
+        os.makedirs(xlsx_path)
+    df.to_excel(os.path.join(xlsx_path,f'{fold_num}.xlsx'), index=False)
+    
+    
+    
+def main(bili_str,baifenbi):
+
+    # snapshot_path=f'/mnt/hys/CPAC_Net/My_mt_with_reg_outputs_True_50%/20251226_lr_1e-2_伪标签由教师模型的确定标签与仿射伪标签共同构成_置信度阈值95e-2_consis_1e-2-2e-2_CE_threshold_6e-1_4e-1_变形图像也参与训练0.5'
+    snapshot_path=f'/mnt/hys/CPAC_Net/My_mt_with_reg_outputs_True_50%/20251226_lr_1e-2_伪标签由教师模型的确定标签与仿射伪标签共同构成_置信度阈值95e-2_consis_1e-2-2e-2_CE_threshold_6e-1_4e-1'
+    if not os.path.exists(snapshot_path):
+        print("%s没有，正在创建" % snapshot_path)
+        os.makedirs(snapshot_path)
+    source1 = '/mnt/hys/CPAC_Net/train_my_mt_with_reg_同个病人_50%.py'
+    source2 = '/mnt/hys/CPAC_Net/mt_Dataset.py'
+    source3 = '/mnt/hys/CPAC_Net/calzhibiao.py'
+    source4 = '/mnt/hys/CPAC_Net/unet_model.py'
+    source5 = '/mnt/hys/CPAC_Net/STN_2d.py'
+    source6 = '/mnt/hys/CPAC_Net/Attention.py'
+    target = snapshot_path+'/'
+    shutil.copy(source1,target)
+    shutil.copy(source2,target)
+    shutil.copy(source3,target)
+    shutil.copy(source4,target)
+    shutil.copy(source5,target)
+    shutil.copy(source6,target)
+    print("复制成功")
+    logging.basicConfig(filename=snapshot_path+"/log.txt", level=logging.INFO,
+                        format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    logging.info(snapshot_path+"/log.txt")
+    # dir_path=f"/mnt/newdisk/lf/zhibiao/zhibiao_7_25_newdata_uamt_buyongwubiaozhushuju{bili_str}%_lr_1e-2_normalize_new_unbz2"
+    dir_path=snapshot_path
+    # data_file='data_new_2/train_dict1.pkl'
+    # dir_path="zhibiao/zhibiao_9_18_up&down_mgd_newdata_pseudo_lossis_ce"
+    if not os.path.exists(dir_path):
+        print("%s没有，正在创建" % dir_path)
+        os.makedirs(dir_path)
+    data_file_list=['/mnt/hys/Datasets/重复测量（hys整理版）/for_5fold_50%/train_dict1.pkl','/mnt/hys/Datasets/重复测量（hys整理版）/for_5fold_50%/train_dict2.pkl','/mnt/hys/Datasets/重复测量（hys整理版）/for_5fold_50%/train_dict3.pkl','/mnt/hys/Datasets/重复测量（hys整理版）/for_5fold_50%/train_dict4.pkl','/mnt/hys/Datasets/重复测量（hys整理版）/for_5fold_50%/train_dict5.pkl']
+    wuzhe_zhibiao=[]
+    file=open(os.path.join(snapshot_path,'wuzhe.txt'),'w')
+    a= 0
+
+    for data_file in data_file_list:
+        a+=1
+        add_content = "threshold = (0.6+0.4*ramps.sigmoid_rampup(iter_num, max_epoch*len(trainloader))*np.log(2)); T_max 200;consistency_weight = 0.01+0.1*get_current_consistency_weight(epoch_num) CE"
+                        
+        # add_content = "threshold = (0.75+0.25*ramps.sigmoid_rampup(iter_num,max_epoch*len(trainloader)))*np.log(2); T_max 200;consistency_weight = 0.01+0.1*get_current_consistency_weight(epoch_num) CE"
+        
+        # if(a!=1):
+        #     continue
+        img_path='/mnt/hys/Datasets/重复测量（hys整理版）/img_crop_npy'
+
+        train(snapshot_path,zhibiao_dir=dir_path,data_file=data_file,baifenbi=baifenbi,fold_num= a)
+        # test_iou_1=cal_zhibiao(dir_path,img_path=img_path,data_file=data_file,model_path=os.path.join(snapshot_path,data_file.split('/')[-1].split('.')[0],'model1_best.pth'),aux=False,data_type="test",device='gpu',add_content=add_content)
+        test_iou_2=cal_zhibiao_hys_dantongdao_jiandanguiyihua_RCPS(fold_num=a,dir_path=dir_path,img_path=img_path,data_file=data_file,model_path=os.path.join(snapshot_path,data_file.split('/')[-1].split('.')[0],'model2_best.pth'),aux=False,data_type="test",device='gpu',model='unet',add_content=add_content,save_result_img=False)
+        wuzhe_zhibiao.append(test_iou_2)
+    rows_to_extract = [0, 3, 4]
+    # 提取指定行
+    extracted_rows = [wuzhe_zhibiao[i] for i in rows_to_extract]    
+    # 将提取的行转换为NumPy数组
+    extracted_array = np.array(extracted_rows)
+
+    # 计算每个指标的平均值和标准差
+    mean_values = np.mean(extracted_array, axis=0)
+    std_values = np.std(extracted_array, axis=0)
+
+    print("Mean values:", mean_values)
+    print("Standard deviations:", std_values)
+    
+    # 计算每个指标的平均值和标准差
+    print(f"145折交叉验证平均iou:{mean_values[0]},标准差：{std_values[0]}\n,145折交叉验证平均hd95:{mean_values[1]},标准差：{std_values[1]}\n,145折交叉验证平均recall:{mean_values[2]},标准差：{std_values[2]}\n\
+        ,145折交叉验证平均sensitivity:{mean_values[3]},标准差：{std_values[3]}\n,145折交叉验证平均dc:{mean_values[4]},标准差：{std_values[4]}\n,145折交叉验证平均jc:{mean_values[5]},标准差：{std_values[5]}\n\
+            ,145折交叉验证平均acc:{mean_values[6]},标准差：{std_values[6]}\n")
+    wuzhe=np.sum(wuzhe_zhibiao,0)/5
+    std = np.std(wuzhe_zhibiao, axis=0)
+    
+    print(wuzhe)
+    print(f"五折交叉验证平均iou:{wuzhe[0]},标准差：{std[0]}\n,五折交叉验证平均hd95:{wuzhe[1]},标准差：{std[1]}\n,五折交叉验证平均recall:{wuzhe[2]},标准差：{std[2]}\n\
+        ,五折交叉验证平均sensitivity:{wuzhe[3]},标准差：{std[3]}\n,五折交叉验证平均dc:{wuzhe[4]},标准差：{std[4]}\n,五折交叉验证平均jc:{wuzhe[5]},标准差：{std[5]}\n\
+            ,五折交叉验证平均acc:{wuzhe[6]},标准差：{std[6]}\n")
+    
+    for i in range(0,5):
+        file.write(f"{str(wuzhe_zhibiao[i])}\n")
+    file.write('\n')
+    file.write(str(wuzhe))
+    
+    file.write('\n')
+    file.write(str(std))
+    file.write('\n')
+    file.write(f"五折交叉验证平均iou:{wuzhe[0]},标准差：{std[0]}\n,五折交叉验证平均hd95:{wuzhe[1]},标准差：{std[1]}\n,五折交叉验证平均recall:{wuzhe[2]},标准差：{std[2]}\n\
+        ,五折交叉验证平均sensitivity:{wuzhe[3]},标准差：{std[3]}\n,五折交叉验证平均dc:{wuzhe[4]},标准差：{std[4]}\n,五折交叉验证平均jc:{wuzhe[5]},标准差：{std[5]}\n\
+            ,五折交叉验证平均acc:{wuzhe[6]},标准差：{std[6]}\n")
+    file.write('\n')
+    file.write(f"145折交叉验证平均iou:{mean_values[0]},标准差：{std_values[0]}\n,145折交叉验证平均hd95:{mean_values[1]},标准差：{std_values[1]}\n,145折交叉验证平均recall:{mean_values[2]},标准差：{std_values[2]}\n\
+        ,145折交叉验证平均sensitivity:{mean_values[3]},标准差：{std_values[3]}\n,145折交叉验证平均dc:{mean_values[4]},标准差：{std_values[4]}\n,145折交叉验证平均jc:{mean_values[5]},标准差：{std_values[5]}\n\
+            ,145折交叉验证平均acc:{mean_values[6]},标准差：{std_values[6]}\n")
+
+
+def set_random_seed(seed_value):
+    """Set the random seed for reproducibility."""
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+if __name__ == "__main__":
+
+    set_random_seed(3407)
+    # main("10",0.1)
+    main("25",0.25)
+    # main("25",0.25)
+    # main("30",0.3)
+    # main("40",0.4)
+    # main("50",0.5)
+
