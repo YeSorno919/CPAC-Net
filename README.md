@@ -67,6 +67,8 @@ pip install -r requirements.txt
 ## 🔨Training 
 
 ### Train Segmentation Model
+First，Remember to copy all files in the utils directory to a subfolder at the same level as the training code！
+
 Use **train_xxx.py** to train the segmentation model. Please pay attention to the file path of the registration model, and automatic testing will be performed after training to obtain experimental results.
 
  ⚠️ Note: The beginning of the **train_xxx.py** file describes the function of this training script, including the full version of CPAC-Net and various ablation experiments.
